@@ -1,0 +1,7 @@
+# Scratch output from /stress cross-AI runs (if a project points STRESS_DIR here)
+.stress/
+*.raw.json
+*.dispatch.meta
+*.trace.log
+
+__pycache__/

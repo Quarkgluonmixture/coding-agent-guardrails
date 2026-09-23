@@ -1,0 +1,206 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{TITLE}}</title>
+<!--
+  claude-kit report-dashboard template — the canonical leader-brief "report look".
+  Light paper background · Charter serif headings · visual-first components · low prose.
+
+  Semantic color slots (class names kept stable so existing dashboards stay copy-compatible):
+    .ours / --ours  = green  → 我们的方案 / positive / confirmed
+    .v4   / --v4    = amber  → caution / legacy / warning
+    .mt3  / --mt3   = teal   → info / precedent / neutral-highlight
+    .no   / --no    = red    → negative / rejected / risk
+
+  Components (delete what you don't need — every section below is one exemplar):
+    masthead · subnav · stats (stat tiles) · triple (colbox) · sent (keep/out 对比双盒)
+    · flow (步骤条) · ladder (rung 列表+状态) · grid2 (cards) · callout · footer
+-->
+<style>
+  :root{
+    --paper:#f5f6f8; --surface:#ffffff; --surface-2:#fafbfc;
+    --line:#e4e7ec; --line-soft:#eceef1;
+    --ink:#161a20; --ink-dim:#3f4854; --muted:#6b7683; --faint:#98a1ac;
+    --accent:#0e5566; --accent-2:#157a8f;
+    --ours:#1c8a5b; --v4:#9a6a10; --mt3:#157a8f; --no:#b04a34;
+    --ours-bg:#e8f4ee; --v4-bg:#f7efda; --mt3-bg:#e7f1f4; --no-bg:#f7ebe6;
+    --serif:"Charter","Bitstream Charter","Hoefler Text","Iowan Old Style",Palatino,Georgia,"Times New Roman",serif;
+    --sans:ui-sans-serif,"SF Pro Text","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo","Cascadia Code",Consolas,monospace;
+    --maxw:1140px;
+  }
+  *{box-sizing:border-box} html{scroll-behavior:auto;overflow-anchor:none}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden;overflow-anchor:none}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 26px} .mono{font-family:var(--mono)}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent-2);font-weight:600}
+  code{font-family:var(--mono);font-size:.9em;color:var(--accent)}
+  header.masthead{padding:50px 0 24px;border-bottom:1px solid var(--line)}
+  .masthead h1{font-family:var(--serif);font-size:clamp(27px,3.6vw,41px);line-height:1.08;font-weight:600;margin:14px 0 10px;letter-spacing:-.01em;text-wrap:balance}
+  .masthead h1 .hl{color:var(--accent)}
+  .masthead .sub{color:var(--ink-dim);max-width:76ch;margin:0;font-size:clamp(14px,1.5vw,16.5px);line-height:1.55}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;padding:5px 11px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--muted);font-family:var(--mono)}
+  .chip b{color:var(--ink)}
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:16px;font-size:12.5px;color:var(--ink-dim)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .sw{width:11px;height:11px;border-radius:3px;flex:none} .sw.ours{background:var(--ours)}.sw.v4{background:var(--v4)}.sw.mt3{background:var(--mt3)}
+  nav.subnav{position:sticky;top:0;z-index:30;background:var(--paper);border-bottom:1px solid var(--line)}
+  nav.subnav .inner{display:flex;gap:4px;overflow-x:auto;padding:9px 26px;max-width:var(--maxw);margin:0 auto;scrollbar-width:none} nav.subnav .inner::-webkit-scrollbar{display:none}
+  nav.subnav a{color:var(--muted);font-size:13px;padding:6px 12px;border-radius:7px;white-space:nowrap;text-decoration:none;font-weight:540}
+  nav.subnav a:hover{color:var(--ink);background:var(--surface)} nav.subnav a.on{color:var(--accent);background:var(--surface);box-shadow:0 0 0 1px var(--line)}
+  section{padding:42px 0 6px;scroll-margin-top:56px}
+  .sec-head{display:flex;align-items:baseline;gap:13px;margin-bottom:7px;flex-wrap:wrap}
+  .sec-head .num{font-family:var(--mono);color:var(--accent-2);font-size:13px;font-weight:700}
+  .sec-head h2{font-family:var(--serif);font-size:clamp(20px,2.3vw,27px);font-weight:600;margin:0;letter-spacing:-.01em}
+  .sec-sub{color:var(--muted);font-size:13.5px;margin:0 0 20px;max-width:80ch}
+  /* triple */
+  .triple{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}
+  .colbox{border:1px solid var(--line);border-radius:14px;background:var(--surface);overflow:hidden;box-shadow:0 1px 2px rgba(16,25,40,.03)}
+  .colbox.ours{border-top:3px solid var(--ours);box-shadow:0 8px 26px -18px rgba(28,138,91,.5)} .colbox.v4{border-top:3px solid var(--v4)} .colbox.mt3{border-top:3px solid var(--mt3)}
+  .colbox .ch{padding:16px 17px 11px}
+  .colbox .ch .tag{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.05em}
+  .colbox.ours .tag{color:var(--ours)} .colbox.v4 .tag{color:var(--v4)} .colbox.mt3 .tag{color:var(--mt3)}
+  .colbox .ch .t{font-family:var(--serif);font-size:19px;font-weight:600;margin-top:7px;line-height:1.12}
+  .colbox .ch .d{font-size:12.5px;color:var(--muted);margin-top:7px;line-height:1.45}
+  .colbox .body{padding:2px 15px 16px}
+  .kv{display:flex;gap:8px;font-size:12.5px;margin-top:9px;align-items:baseline}
+  .kv .kk{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);flex:none;width:74px;padding-top:1px}
+  .kv .vv{color:var(--ink-dim)} .kv .vv b{color:var(--ink)}
+  .grp{margin-top:11px} .grp .gl{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-weight:700;margin-bottom:5px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px}
+  .pill{font-family:var(--mono);font-size:11px;padding:3px 7px;border-radius:6px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-dim)}
+  .colbox.ours .pill{border-color:rgba(28,138,91,.3);background:var(--ours-bg)}.colbox.v4 .pill{border-color:rgba(154,106,16,.28);background:var(--v4-bg)}.colbox.mt3 .pill{border-color:rgba(21,122,143,.28);background:var(--mt3-bg)}
+  /* sent / two-box */
+  .sent{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+  .box{border:1px solid var(--line);border-radius:13px;padding:18px;background:var(--surface)}
+  .box.keep{border-color:rgba(28,138,91,.4);background:var(--ours-bg)} .box.out{border-color:rgba(176,74,52,.4);background:var(--no-bg)}
+  .box h4{font-family:var(--serif);margin:0 0 11px;font-size:16px;font-weight:600;display:flex;align-items:center;gap:8px} .box.keep h4{color:var(--ours)} .box.out h4{color:var(--no)}
+  .box ul{margin:0;padding-left:18px;font-size:13.5px;color:var(--ink-dim)} .box li{margin:7px 0;line-height:1.5} .box li b{color:var(--ink)}
+  /* stat tiles */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}
+  .stat{border:1px solid var(--line);border-top:3px solid var(--ours);border-radius:14px;background:var(--surface);padding:17px 17px 15px;box-shadow:0 1px 2px rgba(16,25,40,.03)}
+  .stat .sv{font-family:var(--serif);font-size:34px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1;color:var(--ours)}
+  .stat .sl{font-size:13px;font-weight:660;margin-top:9px} .stat .sd{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.4}
+  /* flow */
+  .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:11px}
+  .fstep{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:13px 14px}
+  .fstep.hot{border-color:rgba(21,122,143,.4);background:var(--mt3-bg)}
+  .fstep .fn{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--accent-2)}
+  .fstep .ft{font-size:13px;font-weight:640;margin-top:5px;line-height:1.25} .fstep .fd{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.4}
+  /* ladder */
+  .ladder{display:flex;flex-direction:column;gap:9px}
+  .rung{display:grid;grid-template-columns:26px 1fr auto;gap:14px;align-items:center;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+  .rung .qn{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--accent-2)}
+  .rung .what{font-size:13.5px} .rung .what b{color:var(--ink)} .rung .what small{display:block;color:var(--muted);font-size:12px;margin-top:2px;line-height:1.4}
+  .loc{font-size:11px;font-family:var(--mono);padding:4px 11px;border-radius:999px;white-space:nowrap;font-weight:600}
+  .loc.ok{color:var(--ours);background:var(--ours-bg);border:1px solid rgba(28,138,91,.3)} .loc.warn{color:var(--v4);background:var(--v4-bg);border:1px solid rgba(154,106,16,.3)}
+  /* cards */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:19px 20px;box-shadow:0 1px 2px rgba(16,25,40,.03)} .card.warn{border-color:rgba(154,106,16,.32);background:var(--v4-bg)}
+  .card h3{font-family:var(--serif);margin:0 0 9px;font-size:16px;font-weight:600} .card.warn h3{color:var(--v4)}
+  .card ul{margin:0;padding-left:18px;color:var(--ink-dim);font-size:13.5px} .card li{margin:6px 0;line-height:1.5} .card li b{color:var(--ink)}
+  .callout{margin-top:17px;border-left:3px solid var(--accent);border-radius:0 10px 10px 0;padding:14px 17px;background:var(--surface);border-top:1px solid var(--line);border-right:1px solid var(--line);border-bottom:1px solid var(--line);font-size:13px;color:var(--ink-dim);line-height:1.55} .callout b{color:var(--ink)}
+  footer{margin:44px 0 60px;padding-top:22px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.7}
+  @media(max-width:920px){.triple,.stats,.flow{grid-template-columns:1fr}.sent,.grid2{grid-template-columns:1fr}.rung{grid-template-columns:1fr;gap:6px}.rung .loc{justify-self:start}}
+  /* ---- PDF / print ---- */
+  html,body{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  @page{size:1200px 1600px;margin:22px}
+  @media print{
+    nav.subnav{display:none}
+    body{background:#fff}
+    .wrap{padding:0 30px}
+    .masthead{padding-top:6px}
+    section{padding:20px 0 2px;break-inside:auto}
+    .colbox,.stat,.card,.box,.rung,.fstep,.callout{break-inside:avoid}
+    a{color:var(--ink);text-decoration:none}
+  }
+</style></head>
+<body>
+
+<header class="masthead"><div class="wrap">
+  <div class="eyebrow">{{ORG}} · {{PROJECT}} · {{TOPIC}}</div>
+  <h1>{{一句话结论，<span class="hl">重点词</span> 高亮}}</h1>
+  <p class="sub">{{一两句副标题：这页回答什么问题、证据来自哪。}}</p>
+  <div class="meta">
+    <span class="chip">key fact <b>{{value}}</b></span>
+    <span class="chip">scope <b>{{value}}</b></span>
+    <span class="chip">{{YYYY-MM-DD}}</span>
+  </div>
+  <div class="legend">
+    <span><span class="sw ours"></span><b style="color:var(--ours)">{{绿}}</b> — {{我们的/positive}}</span>
+    <span><span class="sw mt3"></span><b style="color:var(--mt3)">{{青}}</b> — {{info/参照}}</span>
+    <span><span class="sw v4"></span><b style="color:var(--v4)">{{琥珀}}</b> — {{caution/旧方案}}</span>
+  </div>
+</div></header>
+
+<nav class="subnav"><div class="inner">
+  <a href="#s1">1 · {{Section}}</a><a href="#s2">2 · {{Section}}</a><a href="#s3">3 · {{Section}}</a>
+</div></nav>
+
+<div class="wrap">
+
+<section id="s1">
+  <div class="sec-head"><span class="num">01</span><h2>{{数字打头的关键结果}}</h2></div>
+  <p class="sec-sub">{{一句话说明这些数字怎么读。}}</p>
+  <div class="stats">
+    <div class="stat"><div class="sv">{{93%}}</div><div class="sl">{{指标名}}</div><div class="sd">{{一句注解}}</div></div>
+    <div class="stat"><div class="sv">{{0}}</div><div class="sl">{{指标名}}</div><div class="sd">{{一句注解}}</div></div>
+    <div class="stat"><div class="sv">{{5}}</div><div class="sl">{{指标名}}</div><div class="sd">{{一句注解}}</div></div>
+    <div class="stat"><div class="sv">{{≈0}}</div><div class="sl">{{指标名}}</div><div class="sd">{{一句注解}}</div></div>
+  </div>
+  <div class="callout"><b>证据：</b>{{结论的出处——命令 / 文件 / 数据来源，给可复查的锚点。}}</div>
+</section>
+
+<section id="s2">
+  <div class="sec-head"><span class="num">02</span><h2>{{方案对比 / 取舍}}</h2></div>
+  <p class="sec-sub">{{为什么摆这几个选项。}}</p>
+  <div class="triple">
+    <div class="colbox v4">
+      <div class="ch"><div class="tag">{{OPTION A}}</div><div class="t">{{名字}}</div><div class="d">{{一句定位}}</div></div>
+      <div class="body">
+        <div class="kv"><span class="kk">{{维度}}</span><span class="vv">{{值}}</span></div>
+        <div class="grp"><div class="gl">{{标签组名}}</div><div class="chips"><span class="pill">{{tag}}</span><span class="pill">{{tag}}</span></div></div>
+      </div>
+    </div>
+    <div class="colbox mt3">
+      <div class="ch"><div class="tag">{{OPTION B}}</div><div class="t">{{名字}}</div><div class="d">{{一句定位}}</div></div>
+      <div class="body"><div class="kv"><span class="kk">{{维度}}</span><span class="vv">{{值}}</span></div></div>
+    </div>
+    <div class="colbox ours">
+      <div class="ch"><div class="tag">{{OURS}}</div><div class="t">{{名字}}</div><div class="d">{{一句定位}}</div></div>
+      <div class="body"><div class="kv"><span class="kk">{{维度}}</span><span class="vv"><b>{{值}}</b></span></div></div>
+    </div>
+  </div>
+  <div class="sent" style="margin-top:15px">
+    <div class="box keep"><h4>✓ {{保留/是什么}}</h4><ul><li>{{point}}</li><li>{{point}}</li></ul></div>
+    <div class="box out"><h4>✕ {{排除/不是什么}}</h4><ul><li>{{point}}</li><li>{{point}}</li></ul></div>
+  </div>
+</section>
+
+<section id="s3">
+  <div class="sec-head"><span class="num">03</span><h2>{{流程 / 状态清单 / 开放问题}}</h2></div>
+  <div class="flow">
+    <div class="fstep"><div class="fn">1</div><div class="ft">{{步骤}}</div><div class="fd">{{注}}</div></div>
+    <div class="fstep hot"><div class="fn">2</div><div class="ft">{{关键步骤}}</div><div class="fd">{{注}}</div></div>
+    <div class="fstep"><div class="fn">3</div><div class="ft">{{步骤}}</div><div class="fd">{{注}}</div></div>
+    <div class="fstep"><div class="fn">4</div><div class="ft">{{步骤}}</div><div class="fd">{{注}}</div></div>
+    <div class="fstep"><div class="fn">5</div><div class="ft">{{步骤}}</div><div class="fd">{{注}}</div></div>
+  </div>
+  <div class="ladder" style="margin-top:15px">
+    <div class="rung"><span class="qn">1</span><span class="what"><b>{{事项}}</b> — {{一句说明}}<small>{{补充}}</small></span><span class="loc ok">{{confirmed}}</span></div>
+    <div class="rung"><span class="qn">2</span><span class="what"><b>{{事项}}</b> — {{一句说明}}</span><span class="loc warn">{{open}}</span></div>
+  </div>
+  <div class="grid2" style="margin-top:15px">
+    <div class="card"><h3>{{卡片标题}}</h3><ul><li>{{point}}</li></ul></div>
+    <div class="card warn"><h3>⚠ {{风险/待决}}</h3><ul><li>{{point}}</li></ul></div>
+  </div>
+</section>
+
+<footer>
+  {{证据出处 / 相关文档路径}} · {{署名 / internal}} · {{YYYY-MM-DD}}
+</footer>
+</div>
+<script>
+  const links=[...document.querySelectorAll('nav.subnav a')],secs=links.map(a=>document.querySelector(a.getAttribute('href')));
+  const obs=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){const i=secs.indexOf(e.target);links.forEach(l=>l.classList.remove('on'));if(links[i])links[i].classList.add('on');}}),{rootMargin:'-40% 0px -55% 0px'});
+  secs.forEach(s=>s&&obs.observe(s));
+</script>
+</body></html>

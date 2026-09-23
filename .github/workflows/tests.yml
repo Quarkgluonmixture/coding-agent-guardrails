@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    name: tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: run test suites
+        run: bash tests/run-all.sh
+
+  macos:
+    # macOS is a first-class runtime for this kit, so `main` — the authority branch —
+    # must have a two-platform read-back, not just "it was green on the laptop".
+    # Feature-branch pushes stay ubuntu-only to keep the 10x-billed runner rare.
+    # (Every bug found 2026-09-04 was INVISIBLE on macOS, so ubuntu is the right
+    # default for the cheap lane; that is an argument for this split, not against it.)
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    name: tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: run test suites
+        run: bash tests/run-all.sh

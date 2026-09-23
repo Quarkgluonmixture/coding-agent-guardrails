@@ -1,0 +1,900 @@
+#!/usr/bin/env bash
+# kit — per-project opt-in helper for claude-kit.
+#
+# Two tiers of rules:
+#   - rules/global/*  always on, machine-wide (install.sh → ~/.claude/rules/). Nothing to do here.
+#   - rules/optin/*   off by default; a project opts in with `kit add`.
+# An opt-in is recorded in ./.claude/kit-rules (committed, portable) and materialised as a
+# symlink under ./.claude/rules/kit/ (machine-local, gitignored — an absolute symlink would
+# dangle on someone else's machine). After cloning a project elsewhere: `kit sync`.
+# (Skills and agents are global: install.sh links skills/* and agents/* into ~/.claude/.)
+#
+#   kit list                     # what's available
+#   kit add <rule>...            # opt this project into rule fragment(s)
+#   kit remove <rule>...         # opt out
+#   kit sync                     # rebuild ./.claude/rules/kit/ from ./.claude/kit-rules
+#   kit status                   # what this project has opted into (declared)
+#   kit state [claude|codex] [--json] # what ACTUALLY loaded into context last session
+#   kit config [on|off <name>]   # which kit assets install.sh links at all (travels in kit.conf)
+#   kit doctor [claude|codex|all] # machine-level health check (default: both)
+#   kit memory-link              # make ~/.claude memory for this project live in ./.claude-memory (git-portable)
+#   kit docs-sync [--check]      # regenerate (or verify) the README asset inventory from the assets themselves
+
+set -euo pipefail
+
+# Portable symlink resolution — GNU `readlink -f` is missing on older macOS/BSD.
+resolve_path() {
+  local t="$1" d
+  while [ -L "$t" ]; do
+    d="$(cd "$(dirname "$t")" && pwd)"
+    t="$(readlink "$t")"
+    case "$t" in /*) : ;; *) t="$d/$t" ;; esac
+  done
+  d="$(cd "$(dirname "$t")" && pwd)"
+  printf '%s/%s' "$d" "$(basename "$t")"
+}
+
+KIT_SELF="$(resolve_path "${BASH_SOURCE[0]}")"
+KIT_ROOT="$(cd "$(dirname "$KIT_SELF")/.." && pwd)"
+# shellcheck source=../lib/assets.sh
+. "$KIT_ROOT/lib/assets.sh"      # asset_registry / asset_state / conf_set / unlink_if_ours
+# Symlinks point through the stable ~/claude-kit alias, not this checkout's path,
+# so moving the clone doesn't dangle every project's links.
+LINK_BASE="$HOME/claude-kit/rules/optin"
+
+MANIFEST="./.claude/kit-rules"
+LINK_DIR="./.claude/rules/kit"
+
+die() { echo "kit: $*" >&2; exit 1; }
+
+# Claude Code derives a project's auto-memory directory from the GIT REPOSITORY, not the
+# directory you happen to stand in, and all worktrees of one repo share it. Slugging $PWD
+# (what this helper used to do) silently produced a different directory whenever you ran
+# from a subdirectory or a linked worktree — and then memory-link linked something Claude
+# Code never reads. Resolve to the main worktree root, with symlinks expanded, because
+# that is the path the slug is built from.
+project_root() {
+  local top common
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || { pwd -P; return; }
+  common="$(cd "$top" && git rev-parse --git-common-dir 2>/dev/null)" || { (cd "$top" && pwd -P); return; }
+  case "$common" in /*) : ;; *) common="$top/$common" ;; esac
+  if [ -d "$common" ]; then (cd "$(dirname "$common")" && pwd -P); else (cd "$top" && pwd -P); fi
+}
+project_slug() { printf '%s' "$(project_root)" | sed 's#/#-#g'; }
+
+# `autoMemoryDirectory` redirects auto memory, but ONLY when the value is absolute or
+# ~/-prefixed. Probed 2026-08-07: a relative path or a "$CLAUDE_PROJECT_DIR/..." value is
+# ignored SILENTLY — memory quietly lands in the default directory while the session
+# reports that it saved. Prints "<scope>\t<value>\t<ok|ignored>" for whatever is set.
+auto_memory_setting() {
+  python3 - "$(project_root)" "$HOME" <<'PY'
+import json, os, sys
+root, home = sys.argv[1], sys.argv[2]
+for scope, path in (("project", os.path.join(root, ".claude", "settings.json")),
+                    ("local", os.path.join(root, ".claude", "settings.local.json")),
+                    ("user", os.path.join(home, ".claude", "settings.json"))):
+    try:
+        val = json.load(open(path)).get("autoMemoryDirectory")
+    except Exception:
+        continue
+    if not val:
+        continue
+    ok = "ok" if (val.startswith("/") or val.startswith("~/")) else "ignored"
+    print(f"{scope}\t{val}\t{ok}")
+PY
+}
+rule_desc() { grep -m1 '^## ' "$1" | sed 's/^## //'; }
+# POSIX class, not \s — BSD grep on macOS does not honour the GNU escape.
+manifest_names() { [ -f "$MANIFEST" ] && grep -vE '^[[:space:]]*(#|$)' "$MANIFEST" || true; }
+
+
+cmd_config() {
+  case "${1:-show}" in
+    show)
+      local kind name state def extra
+      printf '%-8s %-20s %-5s %s\n' KIND NAME STATE NOTE
+      asset_registry | while IFS="$(printf '\t')" read -r kind name def; do
+        state="$(asset_state "$kind" "$name")"
+        extra=""
+        [ "$state" != "$def" ] && extra="(kit.conf overrides default $def)"
+        printf '%-8s %-20s %-5s %s\n' "$kind" "$name" "$state" "$extra"
+      done
+      echo ""
+      echo "改：kit config on <name> / kit config off <name>   （改完自动跑 install.sh 生效）"
+      echo "配置文件：${CONF}（跟仓库走，换机器同一套开关）"
+      ;;
+    on|off)
+      local want="$1" name="${2:-}" kind
+      [ -n "$name" ] || die "usage: kit config $want <name>"
+      kind="$(asset_kind "$name")"
+      [ -n "$kind" ] || die "unknown asset: $name (try: kit config)"
+      conf_set "$kind" "$name" "$want"
+      echo "  $want $kind:$name"
+      "$KIT_ROOT/install.sh" >/dev/null && echo "  applied (install.sh re-run)"
+      ;;
+    *) die "usage: kit config [show|on <name>|off <name>]" ;;
+  esac
+}
+
+cmd_list() {
+  echo "Global rules (always on, via install.sh → ~/.claude/rules/):"
+  for f in "$GLOBAL_RULES"/*.md; do
+    [ -f "$f" ] || continue
+    printf "  %-20s %s\n" "$(basename "$f" .md)" "$(rule_desc "$f")"
+  done
+  echo ""
+  echo "Opt-in rules (kit add <name>):"
+  for f in "$OPTIN_RULES"/*.md; do
+    [ -f "$f" ] || continue
+    printf "  %-20s %s\n" "$(basename "$f" .md)" "$(rule_desc "$f")"
+  done
+  echo ""
+  echo "Global skills (via install.sh; [C]=Claude, [X]=Codex):"
+  for d in "$KIT_ROOT"/skills/*/; do
+    [ -d "$d" ] || continue
+    local skill_name marks="C"
+    skill_name="$(basename "$d")"
+    codex_skill_source "$skill_name" >/dev/null 2>&1 && marks="CX"
+    printf "  [%-2s] /%s\n" "$marks" "$skill_name"
+  done
+  echo ""
+  echo "Global agents (via install.sh):"
+  for f in "$KIT_ROOT"/agents/*.md; do [ -f "$f" ] && printf "  %s\n" "$(basename "$f" .md)"; done
+}
+
+# Make ./.claude/rules/kit/ exactly match the manifest. Only touches symlinks it owns:
+# a real file someone hand-wrote in there is left alone and reported.
+cmd_sync() {
+  local names n dest linked=0 removed=0
+  names="$(manifest_names)"
+  mkdir -p "$LINK_DIR"
+  for n in $names; do
+    [ -f "$OPTIN_RULES/$n.md" ] || { echo "  ✗ $n: no such opt-in rule in kit (stale manifest entry)"; continue; }
+    dest="$LINK_DIR/$n.md"
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+      echo "  ✗ $n: $dest exists and is not a symlink — leaving it alone"
+      continue
+    fi
+    ln -sfn "$LINK_BASE/$n.md" "$dest"
+    linked=$((linked+1))
+  done
+  # drop symlinks for rules no longer in the manifest
+  for dest in "$LINK_DIR"/*.md; do
+    [ -L "$dest" ] || continue
+    n="$(basename "$dest" .md)"
+    printf '%s\n' $names | grep -qx "$n" || { rm -f "$dest"; removed=$((removed+1)); }
+  done
+  rmdir "$LINK_DIR" 2>/dev/null || true
+  echo "  sync: $linked linked · $removed removed"
+}
+
+# The generated symlinks are machine-local; the manifest is what travels in git.
+ensure_gitignore() {
+  local gi="./.claude/.gitignore"
+  [ -f "$gi" ] || printf '# claude-kit: generated symlinks are machine-local; .claude/kit-rules is the portable record\n' > "$gi"
+  grep -qxF 'rules/kit/' "$gi" || printf 'rules/kit/\n' >> "$gi"
+}
+
+cmd_add() {
+  [ $# -ge 1 ] || die "usage: kit add <rule>..."
+  mkdir -p ./.claude
+  [ -f "$MANIFEST" ] || printf '# claude-kit opt-in rules for this project (kit sync rebuilds the symlinks)\n' > "$MANIFEST"
+  for name in "$@"; do
+    [ -f "$OPTIN_RULES/$name.md" ] || die "no such opt-in rule: $name (try: kit list)"
+    if manifest_names | grep -qx "$name"; then
+      echo "  already present: $name"
+    else
+      printf '%s\n' "$name" >> "$MANIFEST"
+      echo "  + $name"
+    fi
+  done
+  ensure_gitignore
+  cmd_sync
+  echo "Done. 提交 $MANIFEST 与 ./.claude/.gitignore；symlink 不进 git（换机器跑 kit sync 重建）。"
+}
+
+cmd_remove() {
+  [ $# -ge 1 ] || die "usage: kit remove <rule>..."
+  [ -f "$MANIFEST" ] || die "no $MANIFEST"
+  for name in "$@"; do
+    if manifest_names | grep -qx "$name"; then
+      grep -vx "$name" "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+      echo "  - removed $name"
+    else
+      echo "  not present: $name"
+    fi
+  done
+  cmd_sync
+}
+
+cmd_status() {
+  echo "Project: $PWD"
+  echo "Opt-in rules (manifest $MANIFEST):"
+  local names n
+  names="$(manifest_names)"
+  if [ -z "$names" ]; then
+    echo "  (none)"
+  else
+    for n in $names; do
+      if [ -L "$LINK_DIR/$n.md" ] && [ -e "$LINK_DIR/$n.md" ]; then echo "  ✓ $n"
+      else echo "  ✗ $n — symlink missing/dangling (run: kit sync)"; fi
+    done
+  fi
+  # legacy: the pre-symlink delivery wrote @imports into the project's CLAUDE.md
+  for legacy in ./.claude/CLAUDE.md ./CLAUDE.md; do
+    [ -f "$legacy" ] || continue
+    if grep -q '@~/claude-kit/rules/' "$legacy" 2>/dev/null; then
+      echo "  △ legacy @import lines still in $legacy — 迁移: kit add <同名规则> 后删掉那些行"
+    fi
+  done
+  # Claude Code reads CLAUDE.md, not AGENTS.md. A project carrying only AGENTS.md
+  # never gets its instructions into Claude's context at all — measured 2026-09-03:
+  # one project had 332 recorded sessions and its AGENTS.md was observed loading in 0
+  # of them. Four projects on this machine were in that state.
+  #
+  # Whether that is wrong is the user's call: a third-party checkout, or a guide
+  # written for Codex only, is a legitimate "no". So this is a hint printed where
+  # someone already asked (`kit status`) — deliberately not a doctor failure, and
+  # deliberately not a SessionStart line. The resident channel is scarce; spending
+  # a line of it on every session to report a project-level maybe is how a channel
+  # stops being read.
+  if [ -f ./AGENTS.md ] && [ ! -e ./CLAUDE.md ] && [ ! -e ./.claude/CLAUDE.md ]; then
+    echo "  △ AGENTS.md but no CLAUDE.md — Claude Code reads CLAUDE.md only, so this"
+    echo "    project's instructions never reach it. If AGENTS.md is meant for Claude:"
+    echo "        echo '@AGENTS.md' > CLAUDE.md"
+    echo "    An import, not a symlink: a symlink needs Administrator or Developer Mode"
+    echo "    on Windows and checks out there as a plain text file. (Codex-only or a"
+    echo "    third-party checkout? Then this hint is correctly ignored.)"
+  fi
+  # ⭐ Driven by asset_registry + asset_verdict, not by walking rules/global/. The
+  # directory walk had two blind spots that pointed in OPPOSITE directions:
+  # `kit config off report-dashboard` unlinks correctly and the walker called the
+  # correct state a failure; and `kit config on cross-ai-review` (an OPT-IN rule made
+  # machine-wide) was never enumerated at all, so a missing link reported green.
+  local kind name verdict label
+  echo "Machine-level assets (kit config):"
+  asset_registry | while IFS="$(printf '\t')" read -r kind name _; do
+    if [ "$kind" = hook ]; then verdict="$(hook_verdict claude "$name")"
+    else verdict="$(asset_verdict claude "$kind" "$name")"; fi
+    label="$kind $name"
+    case "$verdict" in
+      on-ok)       echo "  ✓ $label" ;;
+      on-missing)  echo "  ✗ $label — on, but not linked to this checkout (run install.sh)" ;;
+      off-ok)      echo "  · $label — off (kit config)" ;;
+      off-stale)   echo "  ✗ $label — off, but our link is still there (run install.sh)" ;;
+      off-foreign) echo "  △ $label — off; something not ours sits at that path (left alone)" ;;
+      on-wrong-events) echo "  ✗ $label — registered, but not on the events it needs" ;;
+      settings-unreadable) echo "  ✗ $label — the host settings file could not be read" ;;
+    esac
+  done
+  echo "Codex adapter:"
+  echo "  rules are injected from this same repo at SessionStart/SubagentStart (verify: kit state codex)"
+  asset_registry | while IFS="$(printf '\t')" read -r kind name _; do
+    if [ "$kind" = hook ]; then verdict="$(hook_verdict codex "$name")"
+    else verdict="$(asset_verdict codex "$kind" "$name")"; fi
+    case "$verdict" in
+      n/a|"")      : ;;
+      on-wrong-events) echo "  ✗ $kind $name — registered, but not on the events it needs" ;;
+      settings-unreadable) echo "  ✗ $kind $name — ~/.codex/hooks.json could not be read" ;;
+      on-ok)       echo "  ✓ $kind $name" ;;
+      on-missing)  echo "  ✗ $kind $name — on, but not linked (run install.sh --target codex)" ;;
+      off-ok)      echo "  · $kind $name — off (kit config)" ;;
+      off-stale)   echo "  ✗ $kind $name — off, but our link is still there (run install.sh --target codex)" ;;
+      off-foreign) echo "  △ $kind $name — off; something not ours sits at that path (left alone)" ;;
+    esac
+  done
+  local slug; slug="$(project_slug)"
+  local ams; ams="$(auto_memory_setting)"
+  if [ -n "$ams" ]; then
+    echo "autoMemoryDirectory:"
+    printf '%s\n' "$ams" | while IFS="$(printf '\t')" read -r scope val ok; do
+      if [ "$ok" = ok ]; then
+        echo "  ✓ [$scope] $val — memory 已被重定向到这里（memory-link 的 symlink 会与它冲突）"
+      else
+        echo "  ✗ [$scope] $val — 非绝对路径且非 ~/ 开头 ⇒ **被静默忽略**，memory 实际仍在默认目录"
+        echo "      （不报错、session 照样说「已保存」。相对路径与 \$CLAUDE_PROJECT_DIR 都不展开。）"
+      fi
+    done
+  fi
+  echo "Memory link:"
+  if [ -L "$HOME/.claude/projects/$slug/memory" ]; then echo "  linked → $(readlink "$HOME/.claude/projects/$slug/memory")"; else echo "  not linked (kit memory-link 让 memory 跟项目 git 走)"; fi
+}
+
+cmd_doctor_claude() {
+  local ok=0 warn=0 fail=0
+  chk() { echo "  ✓ $*"; ok=$((ok+1)); }
+  wrn() { echo "  △ $*"; warn=$((warn+1)); }
+  bad() { echo "  ✗ $*"; fail=$((fail+1)); }
+
+  echo "kit doctor [claude] — $(uname -s) $(uname -m)"
+
+  [ -d "$GLOBAL_RULES" ] && [ -d "$OPTIN_RULES" ] && chk "kit root resolves: $KIT_ROOT" || bad "kit root broken: $KIT_ROOT"
+
+  if [ -L "$HOME/.local/bin/kit" ] && [ "$(resolve_path "$HOME/.local/bin/kit")" = "$KIT_SELF" ]; then
+    chk "~/.local/bin/kit → this checkout"
+  else
+    wrn "~/.local/bin/kit not linked to this checkout (run install.sh)"
+  fi
+
+  if [ "$KIT_ROOT" = "$HOME/claude-kit" ]; then
+    chk "clone at ~/claude-kit"
+  elif [ -L "$HOME/claude-kit" ] && [ "$(resolve_path "$HOME/claude-kit")" = "$KIT_ROOT" ]; then
+    chk "~/claude-kit alias → this checkout"
+  else
+    wrn "~/claude-kit alias missing/wrong — 项目侧 symlink 依赖它 (run install.sh)"
+  fi
+
+  # ⭐ Registry-driven and state-aware. These used to be three loops over
+  # skills/, rules/global/ and agents/ that assumed everything must be present:
+  #  · `kit config off <x>` unlinks correctly ⇒ doctor called the CORRECT state a FAILURE;
+  #  · `kit config on cross-ai-review` (opt-in made machine-wide) was never enumerated
+  #    ⇒ if its link was missing, doctor reported GREEN. Two errors, opposite directions.
+  local kind name verdict
+  while IFS="$(printf '\t')" read -r kind name _; do
+    if [ "$kind" = hook ]; then verdict="$(hook_verdict claude "$name")"
+    else verdict="$(asset_verdict claude "$kind" "$name")"; fi
+    case "$verdict" in
+      on-ok)       chk "$kind $name installed" ;;
+      on-missing)  bad "$kind $name is ON but NOT installed (run install.sh)" ;;
+      off-ok)      chk "$kind $name off and removed (kit config)" ;;
+      off-stale)   bad "$kind $name is OFF but its installation survives — install.sh should have removed it" ;;
+      off-foreign) wrn "$kind $name off; a non-kit entry occupies $(asset_dest claude "$kind" "$name") (left alone)" ;;
+      on-wrong-events) bad "hook $name is registered, but not on exactly [$(hook_events claude "$name" | tr '\n' ' ')]" ;;
+      settings-unreadable) bad "hook $name: ~/.claude/settings.json could not be read — state unknown, not 'absent'" ;;
+    esac
+  done <<EOF
+$(asset_registry)
+EOF
+
+  local hk="$KIT_ROOT/hooks/git-guard.sh"
+  local ilh="$KIT_ROOT/hooks/instructions-loaded.sh"
+  [ -x "$hk" ] && chk "git-guard.sh executable" || bad "git-guard.sh not executable"
+  [ -x "$ilh" ] && chk "instructions-loaded.sh executable" || bad "instructions-loaded.sh not executable"
+  local pyh
+  for pyh in wrap-up-trigger gotchas-contract; do
+    [ -x "$KIT_ROOT/hooks/$pyh.py" ] && chk "$pyh.py executable" || bad "$pyh.py not executable"
+  done
+
+  if command -v python3 >/dev/null 2>&1; then
+    chk "python3 available"
+    if [ -f "$HOME/.claude/settings.json" ]; then
+      # (Hook registration state is the shared model now — hook_verdict above.
+      # It used to be counted here with its own python, its own vocabulary, and a
+      # WARNING for "not registered" — a hook that is on but unregistered means the
+      # gate is not running, which is a failure.)
+      # The guard has three outcomes, so the probes assert three outcomes:
+      # deny = exit 2, ask = exit 0 + permissionDecision json, allow = exit 0 + no output.
+      local probe verdict
+      guard_verdict() {
+        printf '{"tool_input":{"command":"%s"}}' "$1" | "$hk" 2>/dev/null | python3 -c '
+import json, sys
+out = sys.stdin.read().strip()
+if not out:
+    print("allow"); raise SystemExit
+try:
+    print(json.loads(out)["hookSpecificOutput"].get("permissionDecision", "?"))
+except Exception:
+    print("?")
+' || echo deny
+      }
+      for probe in 'git add -A' 'git clean -fd' 'git push --force origin main'; do
+        if printf '{"tool_input":{"command":"%s"}}' "$probe" | "$hk" >/dev/null 2>&1; then
+          bad "git-guard failed to DENY '$probe'"
+        else
+          chk "git-guard denies '$probe'"
+        fi
+      done
+      for probe in 'git reset --hard HEAD~1' 'git stash'; do
+        verdict="$(guard_verdict "$probe")"
+        [ "$verdict" = "ask" ] && chk "git-guard asks on '$probe'" || bad "git-guard verdict '$verdict' on '$probe' (want ask)"
+      done
+      for probe in 'git add file.txt' 'git push --force-with-lease origin main' 'git checkout main' 'git stash pop'; do
+        verdict="$(guard_verdict "$probe")"
+        [ "$verdict" = "allow" ] && chk "git-guard allows '$probe'" || bad "git-guard verdict '$verdict' on '$probe' (want allow)"
+      done
+    else
+      wrn "~/.claude/settings.json missing (hook unregistered; run install.sh)"
+    fi
+  else
+    bad "python3 missing — hook + install.sh settings merge need it"
+  fi
+
+  command -v codex >/dev/null 2>&1 && chk "codex CLI present" || wrn "codex missing — /cross-ai 主谱系不可用"
+  command -v agy   >/dev/null 2>&1 && chk "agy CLI present (optional)" || wrn "agy missing — /cross-ai 可选第三谱系不可用"
+
+  echo "doctor [claude]: $ok ok · $warn warn · $fail fail"
+  [ "$fail" -eq 0 ]
+}
+
+cmd_doctor_codex() {
+  local ok=0 warn=0 fail=0
+  chk() { echo "  ✓ $*"; ok=$((ok+1)); }
+  wrn() { echo "  △ $*"; warn=$((warn+1)); }
+  bad() { echo "  ✗ $*"; fail=$((fail+1)); }
+
+  echo "kit doctor [codex] — $(uname -s) $(uname -m)"
+  [ -f "$KIT_ROOT/hooks/codex-rules.py" ] && chk "Codex rule injector present" || bad "hooks/codex-rules.py missing"
+  [ -x "$KIT_ROOT/hooks/codex-rules.py" ] && chk "Codex rule injector executable" || bad "hooks/codex-rules.py not executable"
+  [ -x "$KIT_ROOT/hooks/codex-git-guard.sh" ] && chk "Codex git-guard adapter executable" || bad "hooks/codex-git-guard.sh not executable"
+
+  # Same verdict vocabulary as the Claude side — one state model, two hosts.
+  # ⭐ `off-stale` is a FAILURE here too. It used to be a warning ("disabled Codex
+  # skill still exists"), but `kit config off` is supposed to UNLINK: a surviving
+  # link means the switch silently did not take effect — the same declared-≠-installed
+  # gap this kit built `kit state` for.
+  local kind name verdict
+  while IFS="$(printf '\t')" read -r kind name _; do
+    if [ "$kind" = hook ]; then verdict="$(hook_verdict codex "$name")"
+    else verdict="$(asset_verdict codex "$kind" "$name")"; fi
+    case "$verdict" in
+      n/a|"")      : ;;
+      on-ok)       chk "Codex $kind $name installed" ;;
+      on-missing)  bad "Codex $kind $name is ON but NOT installed (run install.sh --target codex)" ;;
+      off-ok)      chk "Codex $kind $name off and removed (kit config)" ;;
+      off-stale)   bad "Codex $kind $name is OFF but its installation survives — install.sh should have removed it" ;;
+      off-foreign) wrn "Codex $kind $name off; a non-kit entry occupies $(asset_dest codex "$kind" "$name") (left alone)" ;;
+      on-wrong-events) bad "Codex hook $name is registered, but not on exactly [$(hook_events codex "$name" | tr '\n' ' ')]" ;;
+      settings-unreadable) bad "Codex hook $name: ~/.codex/hooks.json could not be read — state unknown" ;;
+    esac
+  done <<EOF
+$(asset_registry)
+EOF
+
+  if command -v python3 >/dev/null 2>&1; then
+    chk "python3 available"
+    if python3 - "$KIT_ROOT/hooks/codex-rules.py" <<'PY' >/dev/null 2>&1
+import sys
+compile(open(sys.argv[1]).read(), sys.argv[1], "exec")
+PY
+    then chk "Codex rule injector parses"; else bad "Codex rule injector has a syntax error"; fi
+
+    # Registration state is the shared model now (hook_verdict above, asserted per
+    # EVENT rather than by count — a count called codex-rules.py's deliberate
+    # SessionStart+SubagentStart pair "duplicated", and could not see a hook bound to
+    # the wrong event at all). Only the file's existence is checked here, because
+    # "the settings file is absent" has a different remedy than "one hook is missing".
+    [ -f "$HOME/.codex/hooks.json" ] || bad "~/.codex/hooks.json missing (run install.sh --target codex)"
+
+    if printf '{"tool_input":{"command":"git reset --hard"}}' | "$KIT_ROOT/hooks/codex-git-guard.sh" >/dev/null 2>&1; then
+      bad "Codex git-guard did not block ASK-tier command"
+    else
+      chk "Codex ASK tier becomes deny-until-bypass"
+    fi
+    if printf '{"tool_input":{"command":"git add file.txt"}}' | "$KIT_ROOT/hooks/codex-git-guard.sh" >/dev/null 2>&1; then
+      chk "Codex git-guard allows explicit-path stage"
+    else
+      bad "Codex git-guard blocked safe explicit-path stage"
+    fi
+  else
+    bad "python3 missing — Codex hooks require it"
+  fi
+
+  if [ -f "$HOME/.codex/config.toml" ] && grep -Eq '^[[:space:]]*hooks[[:space:]]*=[[:space:]]*false' "$HOME/.codex/config.toml" 2>/dev/null; then
+    bad "Codex hooks are disabled in ~/.codex/config.toml"
+  else
+    chk "Codex hooks feature is not explicitly disabled"
+  fi
+  command -v codex >/dev/null 2>&1 && chk "codex CLI present" || wrn "codex CLI not on PATH"
+  command -v claude >/dev/null 2>&1 && chk "claude CLI present for Codex cross-ai" || wrn "claude missing — Codex cross-ai cannot get its second lineage"
+  wrn "hook trust is runtime state: open /hooks after install and trust changed kit hooks"
+
+  echo "doctor [codex]: $ok ok · $warn warn · $fail fail"
+  [ "$fail" -eq 0 ]
+}
+
+cmd_doctor() {
+  local host="${1:-all}" rc=0
+  case "$host" in
+    claude) cmd_doctor_claude || rc=1 ;;
+    codex) cmd_doctor_codex || rc=1 ;;
+    all)
+      cmd_doctor_claude || rc=1
+      echo ""
+      cmd_doctor_codex || rc=1
+      ;;
+    *) die "usage: kit doctor [claude|codex|all]" ;;
+  esac
+  return "$rc"
+}
+
+# What ACTUALLY loaded, not what install.sh believes it linked. Reads the
+# InstructionsLoaded log written by hooks/instructions-loaded.sh and reports the most
+# recent session for this project. The gap between manifest and load is the failure
+# this command exists to make visible.
+cmd_state_claude() {
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+  python3 - "$KIT_ROOT" "$PWD" "$HOME" "$as_json" "$(selected_rules "$PWD" | tr '\n' ';')" <<'PY'
+import json, os, subprocess, sys
+
+kit_root, cwd, home, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+# The EXPECTED set comes from the asset authority (lib/assets.sh selected_rules), not
+# from whichever symlinks happen to exist. Deriving it from links meant an opt-in rule
+# switched on machine-wide was never expected at all, and a missing link quietly
+# REMOVED a rule from the expected set instead of being reported as missing.
+expected = {}
+for entry in (sys.argv[5] or "").split(";"):
+    if entry.strip():
+        name, _, tier = entry.strip().partition(" ")
+        expected[name] = tier or "global"
+log = os.path.join(home, ".claude", "kit-state", "instructions.jsonl")
+
+
+def kit_commit():
+    try:
+        return subprocess.run(["git", "-C", kit_root, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def manifest():
+    path = os.path.join(cwd, ".claude", "kit-rules")
+    if not os.path.exists(path):
+        return []
+    out = []
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+records = []
+if os.path.exists(log):
+    for idx, line in enumerate(open(log)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # Timestamps are second-granularity, so two sessions starting in the same second
+        # would tie. Append order is the real ordering; keep it as the tie-breaker.
+        rec["_seq"] = idx
+        records.append(rec)
+
+# Compare through realpath on BOTH sides: the shell's $PWD keeps symlinks (macOS /tmp
+# is really /private/tmp, and this kit's own ~/claude-kit alias is a symlink), while the
+# hook payload reports the resolved cwd. Matching the raw strings silently finds nothing.
+real_cwd = os.path.realpath(cwd)
+
+
+def rec_cwd(r):
+    return os.path.realpath((r.get("event") or {}).get("cwd") or "")
+
+
+# Sessions launched in a subdirectory still belong to this project; exact cwd first,
+# prefix only as a fallback so a sibling project can never be mistaken for this one.
+mine = [r for r in records if rec_cwd(r) == real_cwd]
+if not mine:
+    mine = [r for r in records if rec_cwd(r).startswith(real_cwd + os.sep)]
+
+session, loaded = None, []
+if mine:
+    latest = max(mine, key=lambda r: (r.get("ts", ""), r["_seq"]))
+    session = (latest.get("event") or {}).get("session_id")
+    seen = set()
+    # `mine` picks the SESSION only. Collect that session's records from
+    # `records`, not from `mine`: the hook's cwd follows `cd` (InstructionsLoaded
+    # docs — "the new directory after Claude runs cd"), so a session launched in
+    # a parent directory keeps its session_start batch under the parent cwd while
+    # later records carry the subdirectory. Filtering by cwd first dropped
+    # exactly the batch that lists the rules.
+    # Measured 2026-09-03: 2 records under the subdirectory vs 8 for the same
+    # session across cwds — `kit state` reported zero rules while five were
+    # demonstrably loaded, and that reading sent a diagnosis down the wrong path.
+    for r in records:
+        ev = r.get("event") or {}
+        if ev.get("session_id") != session:
+            continue
+        fp = ev.get("file_path")
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        loaded.append({"path": fp, "scope": ev.get("memory_type"), "reason": ev.get("load_reason"),
+                       "ts": r.get("ts")})
+
+kit_prefix = os.path.realpath(kit_root) + os.sep
+for item in loaded:
+    real = os.path.realpath(item["path"])
+    item["from_kit"] = real.startswith(kit_prefix)
+    item["name"] = os.path.splitext(os.path.basename(item["path"]))[0]
+    if item["from_kit"]:
+        rel = os.path.relpath(real, os.path.realpath(kit_root))
+        item["tier"] = rel.split(os.sep)[1] if rel.startswith("rules" + os.sep) else "other"
+
+kit_loaded = {i["name"] for i in loaded if i["from_kit"]}
+declared = manifest()
+
+# Global rules that ARE linked into the host but were not observed loading in this
+# session. The usual cause is benign — the link was created after the session
+# started, and rules only load at session start — but it is also what a broken
+# link looks like, and both cases are invisible otherwise. Reported separately
+# from `manifest_not_loaded`, which is about opt-in rules this project declared.
+expected_not_loaded = sorted(n for n in expected if n not in kit_loaded)
+
+# Did the file change after this session loaded it? Answered at REPORT time from the
+# recorded load timestamp vs the file's mtime, so the hot path stays free. Hashing in
+# the hook was measured at ~160ms for six files, and that hook fires once PER FILE at
+# session start — the wrong place to spend it for a diagnostic.
+import datetime as _dt
+for item in loaded:
+    if not item.get("from_kit"):
+        continue
+    try:
+        loaded_at = _dt.datetime.strptime(item["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc).timestamp()
+        item["changed_since_load"] = os.path.getmtime(item["path"]) > loaded_at + 1
+    except (ValueError, KeyError, OSError):
+        item["changed_since_load"] = None
+stale = sorted({i["name"] for i in loaded if i.get("changed_since_load")})
+
+state = {
+    "kit_commit": kit_commit(),
+    "project": cwd,
+    "session": session,
+    "observed_at": max((i["ts"] for i in loaded), default=None),
+    "loaded": loaded,
+    "manifest": declared,
+    "manifest_not_loaded": [n for n in declared if n not in kit_loaded],
+    "expected": sorted(expected),
+    "expected_not_loaded": expected_not_loaded,
+    "changed_since_load": stale,
+    "links": {
+        "skills": sorted(n for n in os.listdir(os.path.join(kit_root, "skills"))
+                         if os.path.islink(os.path.join(home, ".claude", "skills", n))),
+        "agents": sorted(os.path.splitext(f)[0] for f in os.listdir(os.path.join(kit_root, "agents"))
+                         if os.path.islink(os.path.join(home, ".claude", "agents", f))),
+    },
+}
+
+if as_json:
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+    raise SystemExit(0)
+
+print(f"kit state — {state['project']}")
+print(f"  kit commit : {state['kit_commit'] or '(not a git checkout)'}")
+if not loaded:
+    print("  loaded     : (no InstructionsLoaded records for this project yet)")
+    print("               本命令报的是实测加载，不是声明安装。开一个新 session 后再看；")
+    print("               若仍为空，检查 install.sh 是否注册了 instructions-loaded hook。")
+else:
+    print(f"  session    : {state['session']}  @ {state['observed_at']}")
+    print("  actually loaded into context:")
+    for i in loaded:
+        tag = f"kit/{i.get('tier')}" if i["from_kit"] else (i["scope"] or "?").lower()
+        print(f"    [{tag:<12}] {i['path']}")
+if declared:
+    print(f"  opt-in manifest: {', '.join(declared)}")
+    if state["manifest_not_loaded"]:
+        print(f"    ⚠ declared but NOT observed loading: {', '.join(state['manifest_not_loaded'])}")
+        print("      (run `kit sync`, then open a new session — 声明 ≠ 生效)")
+if state["expected_not_loaded"]:
+    print(f"  ⚠ EXPECTED by kit.conf/manifest but NOT observed loading: "
+          f"{', '.join(state['expected_not_loaded'])}")
+if state["changed_since_load"]:
+    print(f"  ⚠ edited AFTER this session loaded them (context is stale): "
+          f"{', '.join(state['changed_since_load'])}")
+    print("      (linked after the session started, or the link is broken — open a new")
+    print("       session; if it persists, run install.sh --target claude)")
+print(f"  linked skills: {', '.join(state['links']['skills']) or '(none)'}")
+print(f"  linked agents: {', '.join(state['links']['agents']) or '(none)'}")
+PY
+}
+
+cmd_state_codex() {
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+  python3 - "$KIT_ROOT" "$PWD" "$HOME" "$as_json" <<'PY'
+import hashlib, json, os, subprocess, sys
+
+kit_root, cwd, home, as_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+log = os.path.join(home, ".codex", "kit-state", "instructions.jsonl")
+
+
+def git_root(path):
+    try:
+        out = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                             capture_output=True, check=True, text=True, timeout=5).stdout.strip()
+        return os.path.realpath(out)
+    except Exception:
+        return os.path.realpath(path)
+
+
+def current_commit():
+    try:
+        return subprocess.run(["git", "-C", kit_root, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def manifest(project):
+    path = os.path.join(project, ".claude", "kit-rules")
+    try:
+        return [line.strip() for line in open(path) if line.strip() and not line.lstrip().startswith("#")]
+    except OSError:
+        return []
+
+
+def current_hash(path):
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        return None
+
+
+project = git_root(cwd)
+records = []
+try:
+    for seq, line in enumerate(open(log)):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if os.path.realpath(record.get("project") or record.get("cwd") or "") == project:
+            record["_seq"] = seq
+            records.append(record)
+except OSError:
+    pass
+
+latest = max(records, key=lambda item: (item.get("ts", ""), item["_seq"])) if records else None
+loaded = []
+if latest:
+    for rule in latest.get("rules", []):
+        item = dict(rule)
+        item["current_sha256"] = current_hash(item.get("path", ""))
+        item["matches_current"] = item.get("sha256") == item["current_sha256"]
+        loaded.append(item)
+
+declared = manifest(project)
+loaded_names = {item.get("name") for item in loaded}
+skills_dir = os.path.join(home, ".agents", "skills")
+agents_dir = os.path.join(home, ".codex", "agents")
+state = {
+    "host": "codex",
+    "kit_commit": current_commit(),
+    "observed_kit_commit": latest.get("kit_commit") if latest else None,
+    "project": project,
+    "session": latest.get("session_id") if latest else None,
+    "event": latest.get("event") if latest else None,
+    "observed_at": latest.get("ts") if latest else None,
+    "loaded": loaded,
+    "manifest": declared,
+    "manifest_not_loaded": [name for name in declared if name not in loaded_names],
+    "links": {
+        "skills": sorted(name for name in os.listdir(skills_dir)
+                         if os.path.islink(os.path.join(skills_dir, name))) if os.path.isdir(skills_dir) else [],
+        "agents": sorted(os.path.splitext(name)[0] for name in os.listdir(agents_dir)
+                         if name.endswith(".toml") and os.path.islink(os.path.join(agents_dir, name)))
+                  if os.path.isdir(agents_dir) else [],
+    },
+}
+
+if as_json:
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+    raise SystemExit
+
+print(f"kit state [codex] — {project}")
+print(f"  kit commit : {state['kit_commit'] or '(not a git checkout)'}")
+if not latest:
+    print("  loaded     : (no Codex SessionStart/SubagentStart record for this project yet)")
+    print("               重开 Codex，在 /hooks 信任 kit hooks 后再看。")
+else:
+    print(f"  session    : {state['session'] or '?'} · {state['event'] or '?'} @ {state['observed_at']}")
+    if state["observed_kit_commit"] != state["kit_commit"]:
+        print(f"  ⚠ observed kit commit {state['observed_kit_commit'] or '?'} != current {state['kit_commit'] or '?'}")
+    print("  rules injected into developer context:")
+    for item in loaded:
+        freshness = "" if item["matches_current"] else "  ⚠ content changed since injection"
+        print(f"    [kit/{item.get('tier', '?'):<7}] {item.get('path')}{freshness}")
+if declared:
+    print(f"  opt-in manifest: {', '.join(declared)}")
+    if state["manifest_not_loaded"]:
+        print(f"    ⚠ declared but NOT observed loading: {', '.join(state['manifest_not_loaded'])}")
+        print("      (open a new Codex session; `kit sync` is only needed by Claude)")
+print(f"  linked skills: {', '.join(state['links']['skills']) or '(none)'}")
+print(f"  linked agents: {', '.join(state['links']['agents']) or '(none)'}")
+PY
+}
+
+cmd_state() {
+  local host=claude as_json=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      claude|codex) host="$arg" ;;
+      --json) as_json=1 ;;
+      *) die "usage: kit state [claude|codex] [--json]" ;;
+    esac
+  done
+  if [ "$host" = codex ]; then
+    if [ "$as_json" = 1 ]; then cmd_state_codex --json; else cmd_state_codex; fi
+  else
+    if [ "$as_json" = 1 ]; then cmd_state_claude --json; else cmd_state_claude; fi
+  fi
+}
+
+cmd_memory_link() {
+  local slug dest src root ams
+  root="$(project_root)"
+  slug="$(project_slug)"
+  # A working autoMemoryDirectory already redirects memory; adding a symlink on top means
+  # two mechanisms pointing at the same thing, and whichever the platform honours wins silently.
+  ams="$(auto_memory_setting | awk -F'\t' '$3=="ok"' || true)"
+  if [ -n "$ams" ]; then
+    echo "  △ 本项目已设 autoMemoryDirectory（$(printf '%s' "$ams" | cut -f2)）——memory 已经被重定向了。"
+    echo "    再 link 一次 symlink = 两套机制指同一处，平台认哪个是静默的。先决定用哪一套。"
+    return 1
+  fi
+  dest="$HOME/.claude/projects/$slug/memory"
+  src="$root/.claude-memory"
+  [ "$root" = "$(pwd -P)" ] || echo "  (按仓库根算：$root — memory 目录由 repo 决定，不由你站在哪个子目录决定)"
+  # If no session has ever used this slug, linking it would be a silent no-op: we'd create
+  # a directory Claude Code never reads and report success. Say so, and show what DOES exist.
+  if [ ! -d "$HOME/.claude/projects/$slug" ]; then
+    echo "  △ ~/.claude/projects/$slug 不存在 —— 这个项目还没有任何 session 记录过 memory。"
+    local near
+    near="$(ls -1 "$HOME/.claude/projects" 2>/dev/null | grep -F "$(basename "$root")" || true)"
+    if [ -n "$near" ]; then
+      echo "    名字相近的现有目录（若其中之一才是这个项目，说明 slug 推导对不上，先别 link）:"
+      printf '      %s\n' $near
+      echo "    确认无误再重跑；或先在该项目里开一个 session 让 Claude Code 自己建目录。"
+      return 1
+    fi
+    echo "    （没有相近目录；继续 link，首个 session 会用上它。）"
+  fi
+  mkdir -p "$src" "$HOME/.claude/projects/$slug"
+  if [ -L "$dest" ]; then
+    echo "  already a symlink → $(readlink "$dest"); re-pointing to $src"
+    ln -sfn "$src" "$dest"; return
+  fi
+  if [ -d "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+    # Conflict scan FIRST. `cp -n` silently keeps $src's copy on a filename clash,
+    # so a stale project-side file would win and get LOADED while the newer local
+    # version sits in a backup — for memory, loading the wrong version is worse
+    # than losing bytes. Same name + different content ⇒ abort, no symlink.
+    local conflicts f rel
+    conflicts=""
+    while IFS= read -r -d '' f; do
+      rel="${f#"$dest"/}"
+      if [ -e "$src/$rel" ] && ! cmp -s "$f" "$src/$rel"; then
+        conflicts="${conflicts}${rel}"$'\n'
+      fi
+    done < <(find "$dest" -type f -print0)
+    if [ -n "$conflicts" ]; then
+      echo "  ✗ CONFLICT — same file, different content on both sides; NOT linking:"
+      printf '%s' "$conflicts" | while IFS= read -r rel; do
+        echo "      $rel"
+        echo "        diff '$dest/$rel' '$src/$rel'"
+      done
+      echo "  逐个决定：保留本机版 → cp 该文件覆盖进 .claude-memory；保留项目版 → 反向覆盖；或手工 merge。"
+      echo "  解决后重跑 kit memory-link（不产生任何更改就中止，两侧均未动）。"
+      return 1
+    fi
+    echo "  moving existing memory from $dest → $src"
+    cp -an "$dest"/. "$src"/ 2>/dev/null || true
+    mv "$dest" "$dest.bak.$(date +%s)"
+    echo "  (old memory backed up at $dest.bak.*)"
+  elif [ -d "$dest" ]; then
+    rmdir "$dest"
+  fi
+  ln -sfn "$src" "$dest"
+  echo "  linked $dest → $src"
+  echo "  现在把 $src 纳入项目 git（私有 repo）即可跨机器复刻。换机后 clone 项目再跑一次 kit memory-link。"
+}
+
+case "${1:-help}" in
+  list) cmd_list ;;
+  add) shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  sync) cmd_sync ;;
+  status) cmd_status ;;
+  state) shift; cmd_state "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  memory-link) cmd_memory_link ;;
+  docs-sync) shift; exec python3 "$KIT_ROOT/lib/docs_sync.py" "$@" ;;
+  *) sed -n '2,22p' "$KIT_SELF" | sed 's/^# \{0,1\}//' ;;
+esac
