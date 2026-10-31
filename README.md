@@ -1,5 +1,7 @@
 # coding-agent-guardrails
 
+**Public portfolio snapshot.** This repository presents the engineering approach and reproducible assets for external readers. The owner’s day-to-day harness and continuing development are maintained in `claude-kit`; this snapshot is not a second live rule authority. Installation below reproduces this snapshot and does not imply synchronization with the private working harness (owner-confirmed positioning, 2026-10-31).
+
 Rules, hooks, skills and a delegation role that make AI coding agents
 (Claude Code and OpenAI Codex CLI) behave more reliably across projects.
 I built and maintained this as my own day-to-day harness. Each rule and hook
@@ -48,7 +50,8 @@ tests/            13 bash suites (run-all.sh) + one manual canary that spends re
 - **Resident rules have a hard byte budget.** Every resident rule is paid for
   in every session and subagent, and too many rules dilute each other.
   `tests/test-rules-budget.sh` sets a 20,000-byte ceiling on `rules/global/`.
-  It is currently at 18,230 bytes (`cat rules/global/*.md | wc -c`). To add a
+  Measure this snapshot with `cat rules/global/*.md | wc -c`; the result describes
+  this checkout, not the live private harness. To add a
   rule you first compress or demote another. Demoted material goes into
   `references/`, and the rule keeps a pointer that says when to read it.
 - **The page-in assumption was tested, not assumed.** `tests/canary-page-in.sh`
